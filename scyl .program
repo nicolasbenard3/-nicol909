@@ -1,0 +1,153 @@
+The operation we are trying to implement is SAXPY, which stands for "Single-precision A times X Plus Y", which can be implemented in C or C++ as follows:
+
+for (size_t i=0; i<length; ++i) {
+    Z[i] += A * X[i] + Y[i];
+}
+There are a lot of ways to write this in C++. For example, we could use ranges, which would make the code look a bit more like the upcoming SYCL version, but teaching you every possible way to write a loop in C++ isn't the point of this tutorial, and everybody understands the version that looks like C.
+
+Here is the same loop in SYCL. There is a lot to unpack here, so we'll break down in pieces.
+
+h.parallel_for<class saxpy>( sycl::range<1>{length}, [=] (sycl::id<1> i) {
+    Z[i] += A * X[i] + Y[i];
+});
+As you might have guessed, parallel_for is a parallel for loop. The loop body is expressed as a lambda -- the lambda is the code that looks like [..]{..}.
+
+The loop iterator is expressed in terms of a sycl::range and an sycl::id. In our simple example, both are one-dimension, as indicated by the <1>. SYCL ranges and ids can be one-, two- or three-dimensional (OpenCL and CUDA have the same limitation).
+
+It may be a bit unfamiliar to write loops like this, but it is consistent with how lambdas work. However, if you have ever have used parallel STL, TBB, Kokkos, or RAJA, you will recognize the pattern.
+
+You might wonder about the <class saxpy> template argument to parallel_for. This is just a way to name the kernel, which is necessary because you might want to use SYCL with a different host C++ compiler than the SYCL device compiler, in which case, the two compilers need a way to agree on the kernel name. In many SYCL compilers, such as Intel DPC++, this isn't necessary and one can tell the compiler to not worry about looking for names by using the option -fsycl-unnamed-lambda.
+
+We won't try to explain what the h in h.parallel_for is right now. That will be covered later.
+
+SYCL queues
+One of the challenges of heterogeneous programming is that there are multiple types of processing elements and often different memory types. These things make compilers and runtimes more complicated.
+
+The SYCL programming model embraces heterogeneous execution, although at a much higher level than OpenCL. Not everything is explicit either - unlike other popular GPU programming models, SYCL kernels can be inlined into the host program flow, which improves readability.
+
+Whenever we want to compute on a device, we need to create a work queue:
+
+sycl::queue q(sycl::default_selector{});
+The default selector favors a GPU if present and a CPU otherwise. One can create queues associated with specific device types using the follow:
+
+sycl::queue q(sycl::host_selector{});        // run on the CPU without a runtime (i.e., no OpenCL)
+sycl::queue q(sycl::cpu_selector{});         // run on the CPU with a runtime (e.g., OpenCL)
+sycl::queue q(sycl::gpu_selector{});         // run on the GPU
+sycl::queue q(sycl::accelerator_selector{}); // run on an FPGA or other acclerator
+The host and CPU selectors may lead to significantly different results, even though they target the same hardware, because the host selector might use a sequential implementation optimized for debugging, while the CPU selector uses the OpenCL runtime and runs across all the cores. Furthermore, the OpenCL JiT compiler might generate different code because it's using a different compiler altogether. Don't assume that just because the host is a CPU, that host and CPU mean the same thing in SYCL!
+
+Managing data in SYCL using buffers
+The canonical way to manage data in SYCL is with buffers. A SYCL buffer is an opaque container. This is an elegant design, but some applications would like pointers, which are provided by the USM extension discussed later.
+
+// T is a data type, e.g. float
+std::vector<T> h_X(length,xval);
+sycl::buffer<T,1> d_X { h_X.data(), sycl::range<1>(h_X.size()) };
+In the previous example, the user allocates a C++ container on the host and then hands it over to SYCL. Until the destructor of the SYCL buffer is invoked, the user cannot access the data through a non-SYCL mechanism.
+
+SYCL accessors are the important aspect of SYCL data management with buffers, which are explained below.
+
+Controlling device execution
+Because device code may require a different compiler or code generation mechanism from the host, it is necessary to clearly identify sections of device code. Below we see how this looks in SYCL 1.2.1. We use the submit method to enqueue work to the device queue, q. This method returns an opaque handler, against which we execute kernels, in this case via parallel_for.
+
+q.submit([&](sycl::handler& h) {
+    ...
+    h.parallel_for<class nstream>( sycl::range<1>{length}, [=] (sycl::id<1> i) {
+        ...
+    });
+});
+q.wait();
+We can synchronize device execution using the wait() method. There are finer grain methods for synchronizing device execution, but we start with simplest one, which is a heavy hammer.
+
+Some users may find the above a bit verbose, particularly compared to models like Kokkos. The Intel DPC++ compiler supports a terse syntax, which will be covered below.
+
+Compute kernels and buffers
+SYCL accessors are the final piece of the puzzle in our first SYCL program. Accessors may be unfamiliar to GPU programmers, but have a number of nice properties relative to other methods. While SYCL allows the programmer to move data explicitly using e.g. the copy() method, the accessor methods do not require this, because they generate a dataflow graph that the compiler and runtime can use to move data at the right time. This is particularly effective when multiple kernels are invoked in sequence; in this case, the SYCL implementation will deduce that data is reused and not copy it back to the host unnecessarily. Furthermore, data movement can be scheduled asynchronously, i.e. overlapped with device execution. While expert GPU programmers can do this manually, we often find that SYCL accessors lead to better performance than OpenCL programs where programmers must move data explicitly.
+
+q.submit([&](sycl::handler& h) {
+
+    auto X = d_X.template get_access<sycl::access::mode::read>(h);
+    auto Y = d_Y.template get_access<sycl::access::mode::read>(h);
+    auto Z = d_Z.template get_access<sycl::access::mode::read_write>(h);
+
+    h.parallel_for<class nstream>( sycl::range<1>{length}, [=] (sycl::id<1> i) {
+        ...
+    });
+});
+Because programming models that assume pointers are handles to memory have a hard time with SYCL accessors, the USM extension makes accessors unnecessary. This places a higher burden on the programmer, but is necessary for compatibility with legacy code.
+
+Review of our first SYCL program
+Below we include all of the components of our SYCL saxpy program that we just described. The full program is included in the repo: saxpy.cc.
+
+    std::vector<float> h_X(length,xval);
+    std::vector<float> h_Y(length,yval);
+    std::vector<float> h_Z(length,zval);
+
+    try {
+
+        sycl::queue q(sycl::default_selector{});
+
+        const float A(aval);
+
+        sycl::buffer<float,1> d_X { h_X.data(), sycl::range<1>(h_X.size()) };
+        sycl::buffer<float,1> d_Y { h_Y.data(), sycl::range<1>(h_Y.size()) };
+        sycl::buffer<float,1> d_Z { h_Z.data(), sycl::range<1>(h_Z.size()) };
+
+        q.submit([&](sycl::handler& h) {
+
+            auto X = d_X.template get_access<sycl::access::mode::read>(h);
+            auto Y = d_Y.template get_access<sycl::access::mode::read>(h);
+            auto Z = d_Z.template get_access<sycl::access::mode::read_write>(h);
+
+            h.parallel_for<class nstream>( sycl::range<1>{length}, [=] (sycl::id<1> it) {
+                const int i = it[0];
+                Z[i] += A * X[i] + Y[i];
+            });
+          });
+          q.wait();
+    }
+    catch (sycl::exception & e) {
+        std::cout << e.what() << std::endl;
+        std::abort();
+    }
+SYCL 2020 Unified Shared Memory (USM)
+While the program above is perfectly functional and can be implemented across a wide range of platforms, some users will find it rather verbose. Furthermore, it's not compatible with libraries and frameworks that need to manage memory using pointers. To address this issue with SYCL 1.2.1, Intel developed an extension in DPC++ called Unified Shared Memory (USM) that supports pointer-based memory management.
+
+USM supports two important usage models, both of which will be illustrated below. The first one supports automatic data movement between the host and device. The second one is for explicit data movement to and from device allocations.
+
+The details are in the SYCL 2020 provisional specification, but to get started, all you need to know is below. The q argument is the queue associated with the device where the allocated data will live (either permanently or temporarily).
+
+    // shared allocation (can migrate between host and device)
+    auto d_X = sycl::malloc_shared<float>(length, q);
+
+    // device allocation (does not migrate)
+    auto d_X = sycl::malloc_device<float>(length, q);
+
+    // deallocation (works with any allocation type)
+    sycl::free(d_X, q);
+If one is using device allocation, data must be moved explicitly, for example using the SYCL memcpy method, which behaves the same way std::memcpy does, e.g. the destination is on the left.
+
+    const size_t bytes = length * sizeof(float);
+
+    // d_Z <- h_Z
+    q.memcpy(d_Z, h_Z.data(), bytes);
+    q.wait();
+
+    // h_Z <- d_Z
+    q.memcpy(h_Z.data(), d_Z, bytes);
+    q.wait();
+If one uses USM, accessors are no longer required, which means the above kernel code can be simplified to the following:
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for<class saxpy>( sycl::range<1>{length}, [=] (sycl::id<1> i) {
+            d_Z[i] += A * d_X[i] + d_Y[i];
+        });
+    });
+You can find the complete working examples of both versions of USM in this repo, named saxpy-usm.cc and saxpy-usm2.cc, respectively.
+
+SYCL 2020 Terse Syntax
+Finally, in case you've been wondering why the opaque handler h was required in each of these programs -- it turns out that it isn't required after all. The following is an equivalent implementation, which was added in the SYCL 2020 provisional specification. Furthermore, we can take advantage of lambda names being optional in the SYCL 2020 provisional specification. Together, these two small changes make SYCL kernels the same length as the original C++ loop listed at the beginning of this tutorial.
+
+    q.parallel_for( sycl::range<1>{length}, [=] (sycl::id<1> i) {
+        d_Z[i] += A * d_X[i] + d_Y[i];
+    });
+We started with three lines of code that run sequentially on a CPU and end with three lines of code that run in parallel on CPUs, GPUs, FPGAs, and other devices. Obviously, not everything will be as simple as SAXPY, but at least now you know that SYCL isn't going to make easy things hard, and it builds on a number of modern C++ features and universal concepts like "parallel for" rather than introducing new things to learn.
